@@ -5,10 +5,9 @@ import threading
 import time
 from collections import deque
 from typing import List, Optional, Tuple
-import re
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -33,7 +32,7 @@ download_progress = 0
 download_error_msg = ""
 llm: Optional[Llama] = None
 
-user_request_lock = {}  # user_id -> bool
+user_request_lock = {}
 request_queue = deque()
 queue_processing = False
 
@@ -44,7 +43,8 @@ DEFAULT_SETTINGS = {
     "n_ctx": 2048,
     "streaming": True,
     "reply": True,
-    "developer_mode": False
+    "developer_mode": False,
+    "system_prompt": "تو یک دستیار مفید و بی‌سازشکاری."
 }
 
 # -------------------- توابع کمکی --------------------
@@ -57,7 +57,11 @@ def load_user_settings(user_id: int) -> dict:
     path = os.path.join(SETTINGS_DIR, f"{user_id}.json")
     if os.path.exists(path):
         with open(path, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            # اطمینان از وجود کلید system_prompt در تنظیمات قدیمی
+            if "system_prompt" not in data:
+                data["system_prompt"] = DEFAULT_SETTINGS["system_prompt"]
+            return data
     return DEFAULT_SETTINGS.copy()
 
 def save_user_settings(user_id: int, settings: dict):
@@ -65,12 +69,20 @@ def save_user_settings(user_id: int, settings: dict):
     with open(path, "w") as f:
         json.dump(settings, f)
 
-def load_chat_history(user_id: int, chat_id: str) -> List[dict]:
+def load_chat_history(user_id: int, chat_id: str, system_prompt: str = None) -> List[dict]:
     filename = os.path.join(CHAT_SESSIONS_DIR, f"{user_id}_{chat_id}.json")
     if os.path.exists(filename):
         with open(filename, "r") as f:
-            return json.load(f)
-    return [{"role": "system", "content": "تو یک دستیار مفید و بی‌سازشکاری."}]
+            history = json.load(f)
+            # اگر history خالی نبود و اولین message از نوع system نبود، آن را اضافه نکن (چت قدیمی)
+            if history and history[0].get("role") == "system":
+                return history
+            # در غیر این صورت، system prompt را در ابتدا قرار بده (برای چت‌های جدید یا فاقد system)
+    # اگر فایل وجود ندارد یا فاقد system prompt است
+    if system_prompt is None:
+        settings = load_user_settings(user_id)
+        system_prompt = settings.get("system_prompt", DEFAULT_SETTINGS["system_prompt"])
+    return [{"role": "system", "content": system_prompt}]
 
 def save_chat_history(user_id: int, chat_id: str, history: List[dict]):
     filename = os.path.join(CHAT_SESSIONS_DIR, f"{user_id}_{chat_id}.json")
@@ -152,19 +164,41 @@ def download_model():
         current_status = STATUS_ERROR
         download_error_msg = str(e)
 
-# -------------------- تولید پاسخ با استریم و محاسبه توکن --------------------
+# -------------------- توابع کمکی برای توکن (تخمینی) --------------------
 def count_tokens(text: str) -> int:
-    """تخمین تعداد توکن (ساده) در صورت عدم دسترسی به tokenizer دقیق"""
-    # این یک تخمین ساده است؛ در عمل می‌توانید از llm.tokenize() استفاده کنید
-    return len(text) // 4  # تقریباً هر 4 کاراکتر یک توکن
+    """تخمین تعداد توکن (هر 4 کاراکتر یک توکن)"""
+    return len(text) // 4
 
-def generate_response(user_id: int, chat_id: str, prompt: str):
+# -------------------- تولید پاسخ در حالت غیراستریم (برای برنامه‌نویس و non-streaming) --------------------
+def get_response_non_streaming(user_id: int, chat_id: str, prompt: str):
+    """یکباره پاسخ را از مدل می‌گیرد و prompt_tokens, completion_tokens را برمی‌گرداند"""
+    settings = load_user_settings(user_id)
+    history = load_chat_history(user_id, chat_id, settings.get("system_prompt"))
+    history.append({"role": "user", "content": prompt})
+    # محاسبه prompt_tokens (تخمینی)
+    prompt_text = json.dumps(history)
+    prompt_tokens = count_tokens(prompt_text)
+
+    response = llm.create_chat_completion(
+        messages=history,
+        max_tokens=settings["max_tokens"],
+        temperature=settings["temperature"],
+        top_p=settings["top_p"],
+        stream=False
+    )
+    full_response = response['choices'][0]['message']['content']
+    completion_tokens = count_tokens(full_response)
+    history.append({"role": "assistant", "content": full_response})
+    save_chat_history(user_id, chat_id, history)
+    update_chat_name_if_needed(user_id, chat_id)
+    return full_response, prompt_tokens, completion_tokens
+
+# -------------------- تولید پاسخ با استریم (برای حالت عادی) --------------------
+def generate_response_stream(user_id: int, chat_id: str, prompt: str):
     """Generator که توکن‌ها را به همراه آمار نهایی برمی‌گرداند"""
     settings = load_user_settings(user_id)
-    history = load_chat_history(user_id, chat_id)
+    history = load_chat_history(user_id, chat_id, settings.get("system_prompt"))
     history.append({"role": "user", "content": prompt})
-
-    # محاسبه prompt_tokens (تخمینی)
     prompt_text = json.dumps(history)
     prompt_tokens = count_tokens(prompt_text)
 
@@ -183,48 +217,55 @@ def generate_response(user_id: int, chat_id: str, prompt: str):
             if content:
                 full_response += content
                 yield content, None, None
-    # پس از اتمام
     completion_tokens = count_tokens(full_response)
     history.append({"role": "assistant", "content": full_response})
     save_chat_history(user_id, chat_id, history)
-    update_chat_name_if_needed(user_id, chat_id)  # مشکل 10
+    update_chat_name_if_needed(user_id, chat_id)
     yield None, prompt_tokens, completion_tokens
 
-# -------------------- ارسال پاسخ با مدیریت استریم و تقسیم خروجی --------------------
+# -------------------- ارسال پاسخ با مدیریت حالت‌ها --------------------
 async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: str, prompt: str):
     settings = load_user_settings(user_id)
-    streaming = settings.get("streaming", True)
     dev_mode = settings.get("developer_mode", False)
 
-    if not streaming or dev_mode:
-        # حالت غیراستریم یا برنامه‌نویس: یکجا جمع کن و تقسیم به بخش‌های 3500 کاراکتری
-        full_response = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        for token, pt, ct in generate_response(user_id, chat_id, prompt):
-            if token:
-                full_response += token
-            else:
-                prompt_tokens = pt or 0
-                completion_tokens = ct or 0
-        # تقسیم خروجی به بخش‌های 3500 کاراکتری با برچسب
+    # ---------- حالت برنامه‌نویس: فقط فایل، بدون هیچ متن در چت ----------
+    if dev_mode:
+        try:
+            full_response, prompt_tokens, completion_tokens = get_response_non_streaming(user_id, chat_id, prompt)
+            # ذخیره فایل
+            timestamp = int(time.time())
+            filename = f"response_{user_id}_{chat_id}_{timestamp}.txt"
+            filepath = os.path.join(LOGS_DIR, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"User: {prompt}\n\nAssistant:\n{full_response}\n\n---\nPrompt tokens: {prompt_tokens}\nCompletion tokens: {completion_tokens}\nTotal tokens: {prompt_tokens+completion_tokens}")
+            # ارسال فایل به عنوان سند
+            with open(filepath, "rb") as doc:
+                await update.message.reply_document(
+                    document=InputFile(doc, filename=filename),
+                    reply_to_message_id=update.message.message_id if settings.get("reply", True) else None
+                )
+            # پس از ارسال فایل، فایل محلی را پاک می‌کنیم (اختیاری)
+            # os.remove(filepath)
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در حالت برنامه‌نویس: {str(e)}")
+        return
+
+    # ---------- حالت عادی (غیر برنامه‌نویس) ----------
+    streaming = settings.get("streaming", True)
+
+    if not streaming:
+        # حالت غیراستریم: یکجا بگیر و تقسیم به بخش‌های 3500 کاراکتری با برچسب
+        full_response, prompt_tokens, completion_tokens = get_response_non_streaming(user_id, chat_id, prompt)
         parts = [full_response[i:i+3500] for i in range(0, len(full_response), 3500)]
         for idx, part in enumerate(parts):
             prefix = f"(بخش {idx+1}/{len(parts)})\n" if len(parts) > 1 else ""
             text = prefix + part
             await update.message.reply_text(text, reply_to_message_id=update.message.message_id if settings.get("reply", True) else None)
-        # گزارش توکن
         await update.message.reply_text(f"📊 آمار توکن: ورودی={prompt_tokens} | خروجی={completion_tokens} | مجموع={prompt_tokens+completion_tokens}")
-        # ذخیره فایل در حالت برنامه‌نویس
-        if dev_mode:
-            log_file = os.path.join(LOGS_DIR, f"{user_id}_{chat_id}_{int(time.time())}.txt")
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(f"User: {prompt}\n\nAssistant:\n{full_response}\n\n---\nPrompt tokens: {prompt_tokens}\nCompletion tokens: {completion_tokens}")
-            await update.message.reply_text(f"📁 خروجی خام در فایل {log_file} ذخیره شد.")
         return
 
     # حالت استریمینگ با ادیت هر ۷ ثانیه و مدیریت پیام‌های بلند
-    generator = generate_response(user_id, chat_id, prompt)
+    generator = generate_response_stream(user_id, chat_id, prompt)
     first_chunk = True
     message = None
     current_text = ""
@@ -232,7 +273,6 @@ async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user
     part_counter = 1
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    message_ids = []  # برای ذخیره message_idهای ارسال شده (جهت پاک کردن احتمالی در آینده)
 
     try:
         for token, pt, ct in generator:
@@ -240,7 +280,6 @@ async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 current_text += token
                 now = time.time()
                 if now - last_edit_time >= 7:
-                    # اگر طول از 3500 بیشتر شد، پیام جدید بفرست
                     if len(current_text) > 3500:
                         part_text = current_text[:3500]
                         remainder = current_text[3500:]
@@ -250,13 +289,11 @@ async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                                 message_id=message.message_id,
                                 text=part_text
                             )
-                        # ارسال پیام جدید با برچسب ادامه
                         prefix = f"(ادامه {part_counter+1})\n"
                         new_msg = await update.message.reply_text(
                             prefix + "⏳ در حال تولید...",
                             reply_to_message_id=update.message.message_id if settings.get("reply", True) else None
                         )
-                        message_ids.append(new_msg.message_id)
                         message = new_msg
                         current_text = remainder
                         part_counter += 1
@@ -271,53 +308,38 @@ async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                             except Exception:
                                 pass
                         else:
-                            # اولین پیام
                             sent = await update.message.reply_text(
                                 "⏳ در حال تولید...",
                                 reply_to_message_id=update.message.message_id if settings.get("reply", True) else None
                             )
                             message = sent
-                            message_ids.append(sent.message_id)
                             first_chunk = False
                     last_edit_time = now
             else:
-                # پایان استریم
                 total_prompt_tokens = pt or 0
                 total_completion_tokens = ct or 0
                 break
 
-        # ادیت نهایی آخرین پیام
         if message and current_text:
             await context.bot.edit_message_text(
                 chat_id=message.chat_id,
                 message_id=message.message_id,
                 text=current_text
             )
-        # ارسال آمار
         await update.message.reply_text(f"📊 آمار توکن: ورودی={total_prompt_tokens} | خروجی={total_completion_tokens} | مجموع={total_prompt_tokens+total_completion_tokens}")
-        if dev_mode:
-            log_file = os.path.join(LOGS_DIR, f"{user_id}_{chat_id}_{int(time.time())}.txt")
-            with open(log_file, "w", encoding="utf-8") as f:
-                f.write(f"User: {prompt}\n\nAssistant:\n{current_text}\n\n---\nPrompt tokens: {total_prompt_tokens}\nCompletion tokens: {total_completion_tokens}")
-            await update.message.reply_text(f"📁 خروجی خام در فایل {log_file} ذخیره شد.")
     except Exception as e:
         error_text = f"❌ خطا در تولید پاسخ: {str(e)}"
         if message:
             try:
-                await context.bot.edit_message_text(
-                    chat_id=message.chat_id,
-                    message_id=message.message_id,
-                    text=error_text
-                )
+                await context.bot.edit_message_text(chat_id=message.chat_id, message_id=message.message_id, text=error_text)
             except:
                 await update.message.reply_text(error_text)
         else:
             await update.message.reply_text(error_text)
-        # جلوگیری از flood (مشکل 12)
         await asyncio.sleep(1)
         raise
 
-# -------------------- پردازنده صف با قفل کاربری و try/finally --------------------
+# -------------------- پردازنده صف --------------------
 async def process_queue(app: Application):
     global queue_processing
     while True:
@@ -338,7 +360,7 @@ async def process_queue(app: Application):
                 queue_processing = False
         await asyncio.sleep(0.5)
 
-# -------------------- هندلرهای تلگرام با مدیریت منو --------------------
+# -------------------- هندلرهای تلگرام --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_status != STATUS_READY:
         if current_status == STATUS_DOWNLOADING:
@@ -363,11 +385,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, as_
     else:
         await update.message.reply_text(text, reply_markup=reply_markup)
 
-async def safe_edit(query, text, reply_markup=None):
-    """ویرایش تنها در صورت تغییر محتوا"""
-    if query.message.text == text and query.message.reply_markup == reply_markup:
+async def safe_edit(query, text, reply_markup=None, parse_mode=None):
+    if query.message.text == text and query.message.reply_markup == reply_markup and parse_mode is None:
         return
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -384,7 +405,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📖 n_ctx: {settings['n_ctx']}\n"
             f"⚡ استریمینگ: {'فعال' if settings['streaming'] else 'غیرفعال'}\n"
             f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
-            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}"
+            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
+            f"✏️ سیستم پرامپت: {settings.get('system_prompt', DEFAULT_SETTINGS['system_prompt'])[:50]}..."
         )
         keyboard = [
             [InlineKeyboardButton("ویرایش max_tokens", callback_data="edit_max_tokens")],
@@ -394,6 +416,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("تغییر استریمینگ", callback_data="toggle_streaming")],
             [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
             [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
+            [InlineKeyboardButton("✏️ ویرایش سیستم پرامپت", callback_data="edit_system_prompt")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
         ]
         await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
@@ -409,15 +432,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = load_user_settings(user_id)
         settings["streaming"] = not settings["streaming"]
         save_user_settings(user_id, settings)
-        # به جای recursive call، مستقیماً منوی تنظیمات را به‌روز می‌کنیم
-        new_settings_text = (
+        # به‌روزرسانی مستقیم منوی تنظیمات
+        new_text = (
             f"📏 max_tokens: {settings['max_tokens']}\n"
             f"🌡️ temperature: {settings['temperature']}\n"
             f"🎯 top_p: {settings['top_p']}\n"
             f"📖 n_ctx: {settings['n_ctx']}\n"
             f"⚡ استریمینگ: {'فعال' if settings['streaming'] else 'غیرفعال'}\n"
             f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
-            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}"
+            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
+            f"✏️ سیستم پرامپت: {settings.get('system_prompt', DEFAULT_SETTINGS['system_prompt'])[:50]}..."
         )
         keyboard = [
             [InlineKeyboardButton("ویرایش max_tokens", callback_data="edit_max_tokens")],
@@ -427,24 +451,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("تغییر استریمینگ", callback_data="toggle_streaming")],
             [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
             [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
+            [InlineKeyboardButton("✏️ ویرایش سیستم پرامپت", callback_data="edit_system_prompt")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
         ]
-        await safe_edit(query, new_settings_text, InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, new_text, InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "toggle_reply":
         settings = load_user_settings(user_id)
         settings["reply"] = not settings["reply"]
         save_user_settings(user_id, settings)
-        # همانند بالا
-        new_settings_text = (
+        new_text = (
             f"📏 max_tokens: {settings['max_tokens']}\n"
             f"🌡️ temperature: {settings['temperature']}\n"
             f"🎯 top_p: {settings['top_p']}\n"
             f"📖 n_ctx: {settings['n_ctx']}\n"
             f"⚡ استریمینگ: {'فعال' if settings['streaming'] else 'غیرفعال'}\n"
             f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
-            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}"
+            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
+            f"✏️ سیستم پرامپت: {settings.get('system_prompt', DEFAULT_SETTINGS['system_prompt'])[:50]}..."
         )
         keyboard = [
             [InlineKeyboardButton("ویرایش max_tokens", callback_data="edit_max_tokens")],
@@ -454,23 +479,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("تغییر استریمینگ", callback_data="toggle_streaming")],
             [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
             [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
+            [InlineKeyboardButton("✏️ ویرایش سیستم پرامپت", callback_data="edit_system_prompt")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
         ]
-        await safe_edit(query, new_settings_text, InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, new_text, InlineKeyboardMarkup(keyboard))
         return
 
     elif data == "toggle_dev_mode":
         settings = load_user_settings(user_id)
         settings["developer_mode"] = not settings.get("developer_mode", False)
         save_user_settings(user_id, settings)
-        new_settings_text = (
+        new_text = (
             f"📏 max_tokens: {settings['max_tokens']}\n"
             f"🌡️ temperature: {settings['temperature']}\n"
             f"🎯 top_p: {settings['top_p']}\n"
             f"📖 n_ctx: {settings['n_ctx']}\n"
             f"⚡ استریمینگ: {'فعال' if settings['streaming'] else 'غیرفعال'}\n"
             f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
-            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}"
+            f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
+            f"✏️ سیستم پرامپت: {settings.get('system_prompt', DEFAULT_SETTINGS['system_prompt'])[:50]}..."
         )
         keyboard = [
             [InlineKeyboardButton("ویرایش max_tokens", callback_data="edit_max_tokens")],
@@ -480,9 +507,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("تغییر استریمینگ", callback_data="toggle_streaming")],
             [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
             [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
+            [InlineKeyboardButton("✏️ ویرایش سیستم پرامپت", callback_data="edit_system_prompt")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
         ]
-        await safe_edit(query, new_settings_text, InlineKeyboardMarkup(keyboard))
+        await safe_edit(query, new_text, InlineKeyboardMarkup(keyboard))
+        return
+
+    elif data == "edit_system_prompt":
+        context.user_data["waiting_for"] = "system_prompt"
+        await safe_edit(query, "لطفاً سیستم پرامپت جدید را به صورت متن ارسال کنید (این پرامپت در ابتدای هر چت جدید قرار می‌گیرد):")
         return
 
     elif data == "list_chats":
@@ -509,7 +542,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "reset_account":
-        # پاک کردن تمام فایل‌های کاربر
         for f in os.listdir(SETTINGS_DIR):
             if f.startswith(f"{user_id}"):
                 os.remove(os.path.join(SETTINGS_DIR, f))
@@ -519,7 +551,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_settings(user_id, DEFAULT_SETTINGS.copy())
         await safe_edit(query, "اکانت شما با موفقیت ریست شد. تمام داده‌ها پاک گردید.")
         await asyncio.sleep(1)
-        # نمایش منوی اصلی (به عنوان پیام جدید چون callback تمام شده)
         await show_main_menu(update, context, as_edit=False)
         return
 
@@ -532,7 +563,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- `n_ctx`: حافظه مکالمه (بیشتر = خاطره بیشتر، رم بیشتر).\n"
             "- استریمینگ: نمایش زنده پاسخ (ادیت هر ۷ ثانیه).\n"
             "- ریپلای: پاسخ به پیام شما به صورت ریپلای.\n"
-            "- حالت برنامه‌نویس: ذخیره خروجی خام در فایل متنی.\n"
+            "- حالت برنامه‌نویس: خروجی فقط در فایل txt ارسال می‌شود (بدون نمایش در چت).\n"
+            "- سیستم پرامپت: شخصیت و قوانین رفتاری مدل را تعیین می‌کند.\n"
             "- ریست اکانت: تمام داده‌های شما را پاک می‌کند.\n\n"
             "برای تغییر هر گزینه، به بخش تنظیمات بروید."
         )
@@ -563,12 +595,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 settings["top_p"] = float(text)
             elif waiting == "n_ctx":
                 settings["n_ctx"] = int(text)
+            elif waiting == "system_prompt":
+                settings["system_prompt"] = text.strip()
             save_user_settings(user_id, settings)
             await update.message.reply_text(f"{waiting} به {text} تغییر یافت.")
         except Exception as e:
             await update.message.reply_text(f"مقدار نامعتبر: {e}")
         context.user_data["waiting_for"] = None
-        # بازگشت به منوی تنظیمات
         await show_main_menu(update, context, as_edit=False)
         return
 
