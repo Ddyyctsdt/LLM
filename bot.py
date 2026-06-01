@@ -18,7 +18,7 @@ from llama_cpp import Llama
 
 # -------------------- تنظیمات اولیه --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MODEL_URL = "https://huggingface.co/HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf?download=true"
+MODEL_URL = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q4_K_XL.gguf?download=true"
 MODEL_PATH = "model.gguf"
 SETTINGS_DIR = "user_settings"
 CHAT_SESSIONS_DIR = "chat_sessions"
@@ -43,13 +43,14 @@ DEFAULT_SETTINGS = {
     "max_tokens": 500,
     "temperature": 0.7,
     "top_p": 0.95,
-    "n_ctx": 2048,
+    "n_ctx": 4096,  # افزایش برای Cache Reuse بهتر
     "streaming": True,
     "reply": True,
     "developer_mode": False,
-    "system_prompt_enabled": False,     # سیستم پرامپت پیش‌فرض خاموش
+    "system_prompt_enabled": False,
     "system_prompt": "تو یک دستیار مفید و بی‌سازشکاری.",
-    "show_thinking_timer": True
+    "show_thinking_timer": True,
+    "enable_thinking": True  # گزینه جدید: فعال/غیرفعال کردن Think
 }
 
 # -------------------- توابع کمکی --------------------
@@ -83,14 +84,11 @@ def clean_response(text: str) -> str:
     return "\n".join(lines)
 
 def load_chat_history(user_id: int, chat_id: str) -> List[dict]:
-    """بارگذاری تاریخچه چت بدون سیستم پرامپت (سیستم پرامپت در زمان نیاز اضافه می‌شود)"""
     filename = os.path.join(CHAT_SESSIONS_DIR, f"{user_id}_{chat_id}.json")
     if os.path.exists(filename):
         with open(filename, "r") as f:
-            history = json.load(f)
-            # اگر تاریخچه دارای system message در ابتدا بود، آن را حذف نمی‌کنیم (برای چت‌های قدیمی)
-            return history
-    return []   # تاریخچه خالی
+            return json.load(f)
+    return []
 
 def save_chat_history(user_id: int, chat_id: str, history: List[dict]):
     filename = os.path.join(CHAT_SESSIONS_DIR, f"{user_id}_{chat_id}.json")
@@ -145,23 +143,13 @@ def update_chat_name_if_needed(user_id: int, chat_id: str):
             if new_name:
                 set_chat_name(user_id, chat_id, new_name)
 
-# -------------------- ساخت تاریخچه با توجه به تنظیمات سیستم پرامپت --------------------
 def build_history_with_system(user_id: int, history: List[dict]) -> List[dict]:
-    """اگر سیستم پرامپت فعال باشد، آن را به ابتدای تاریخچه اضافه می‌کند"""
     settings = load_user_settings(user_id)
     if settings.get("system_prompt_enabled", False):
         system_prompt = settings.get("system_prompt", DEFAULT_SETTINGS["system_prompt"])
-        # اگر تاریخچه خالی است یا اولین پیام system نیست، اضافه کن
         if not history or history[0].get("role") != "system":
             return [{"role": "system", "content": system_prompt}] + history
-        else:
-            # در غیر این صورت، فقط همان history را برگردان
-            return history
-    else:
-        # اگر سیستم پرامپت غیرفعال است، هر پیام system موجود در ابتدا را حذف کن
-        if history and history[0].get("role") == "system":
-            return history[1:]
-        return history
+    return history
 
 # -------------------- دانلود مدل --------------------
 def download_model():
@@ -184,7 +172,7 @@ def download_model():
         llm = Llama(
             model_path=MODEL_PATH,
             n_ctx=DEFAULT_SETTINGS["n_ctx"],
-            n_threads=4,
+            n_threads=os.cpu_count() or 2,  # استفاده از تمام هسته‌های CPU
             chat_format="qwen",
             verbose=False
         )
@@ -212,12 +200,12 @@ def get_response_non_streaming(user_id: int, chat_id: str, prompt: str) -> Tuple
         max_tokens=settings["max_tokens"],
         temperature=settings["temperature"],
         top_p=settings["top_p"],
-        stream=False
+        stream=False,
+        chat_template_kwargs={"enable_thinking": settings.get("enable_thinking", True)}
     )
     raw_response = response['choices'][0]['message']['content']
     cleaned_response = clean_response(raw_response)
     completion_tokens = count_tokens(cleaned_response)
-    # ذخیره در تاریخچه خام (بدون سیستم پرامپت)
     raw_history.append({"role": "user", "content": prompt})
     raw_history.append({"role": "assistant", "content": cleaned_response})
     save_chat_history(user_id, chat_id, raw_history)
@@ -238,7 +226,8 @@ def generate_response_stream(user_id: int, chat_id: str, prompt: str):
         max_tokens=settings["max_tokens"],
         temperature=settings["temperature"],
         top_p=settings["top_p"],
-        stream=True
+        stream=True,
+        chat_template_kwargs={"enable_thinking": settings.get("enable_thinking", True)}
     )
     full_response = ""
     for chunk in stream:
@@ -250,7 +239,6 @@ def generate_response_stream(user_id: int, chat_id: str, prompt: str):
                 yield content, None, None
     cleaned = clean_response(full_response)
     completion_tokens = count_tokens(cleaned)
-    # ذخیره در تاریخچه خام
     raw_history.append({"role": "user", "content": prompt})
     raw_history.append({"role": "assistant", "content": cleaned})
     save_chat_history(user_id, chat_id, raw_history)
@@ -505,6 +493,7 @@ async def refresh_settings_menu(query, user_id):
         f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
         f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
         f"🧠 نمایش تایمر: {'فعال' if settings.get('show_thinking_timer', True) else 'غیرفعال'}\n"
+        f"🧠 Think: {'فعال' if settings.get('enable_thinking', True) else 'غیرفعال'}\n"
         f"✏️ سیستم پرامپت: {'فعال' if settings.get('system_prompt_enabled', False) else 'خاموش'}\n"
     )
     if settings.get('system_prompt_enabled', False):
@@ -518,6 +507,7 @@ async def refresh_settings_menu(query, user_id):
         [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
         [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
         [InlineKeyboardButton("تغییر نمایش تایمر", callback_data="toggle_timer")],
+        [InlineKeyboardButton("فعال/غیرفعال کردن Think", callback_data="toggle_thinking")],
         [InlineKeyboardButton("فعال/غیرفعال کردن سیستم پرامپت", callback_data="toggle_system_prompt")],
         [InlineKeyboardButton("✏️ ویرایش متن سیستم پرامپت", callback_data="edit_system_prompt_text")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
@@ -548,7 +538,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, f"لطفاً مقدار جدید {param} را بفرستید:")
         return
 
-    elif data in ["toggle_streaming", "toggle_reply", "toggle_dev_mode", "toggle_timer", "toggle_system_prompt"]:
+    elif data in ["toggle_streaming", "toggle_reply", "toggle_dev_mode", "toggle_timer", "toggle_system_prompt", "toggle_thinking"]:
         settings = load_user_settings(user_id)
         if data == "toggle_streaming":
             settings["streaming"] = not settings["streaming"]
@@ -560,6 +550,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings["show_thinking_timer"] = not settings.get("show_thinking_timer", True)
         elif data == "toggle_system_prompt":
             settings["system_prompt_enabled"] = not settings.get("system_prompt_enabled", False)
+        elif data == "toggle_thinking":
+            settings["enable_thinking"] = not settings.get("enable_thinking", True)
         save_user_settings(user_id, settings)
         await refresh_settings_menu(query, user_id)
         return
@@ -611,6 +603,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- ریپلای: پاسخ به پیام شما به صورت ریپلای.\n"
             "- حالت برنامه‌نویس: خروجی فقط در فایل txt ارسال می‌شود (بدون نمایش در چت).\n"
             "- نمایش تایمر: هنگام تولید پاسخ، یک پیام با تایمر نشان می‌دهد و می‌توانید لغو کنید.\n"
+            "- Think: فعال/غیرفعال کردن فرآیند استدلال داخلی مدل (غیرفعال = سریع‌تر).\n"
             "- سیستم پرامپت: می‌توانید یک دستورالعمل سیستمی برای مدل تنظیم کنید (پیش‌فرض خاموش).\n"
             "- ریست اکانت: تمام داده‌های شما را پاک می‌کند.\n\n"
             "برای تغییر هر گزینه، به بخش تنظیمات بروید."
