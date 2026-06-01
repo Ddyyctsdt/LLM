@@ -18,7 +18,7 @@ from llama_cpp import Llama
 
 # -------------------- تنظیمات اولیه --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MODEL_URL = "https://huggingface.co/Sinbad-The-Sailor/Qwen3.5-4B-NSFW-ARA-Heretic-Literotica-i1-GGUF/resolve/main/Qwen3.5-4B-NSFW-ARA-Heretic-Literotica-i1-Q4_K_M.gguf"
+MODEL_URL = "https://huggingface.co/Sinbad-The-Sailor/Qwen3.5-4B-NSFW-ARA-Heretic-Literotica-i1-GGUF/resolve/main/Qwen3.5-4B-NSFW-ARA-Heretic-Literotica.i1.Q5_K_M.gguf?download=true"
 MODEL_PATH = "model.gguf"
 SETTINGS_DIR = "user_settings"
 CHAT_SESSIONS_DIR = "chat_sessions"
