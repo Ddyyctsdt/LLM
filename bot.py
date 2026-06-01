@@ -43,14 +43,13 @@ DEFAULT_SETTINGS = {
     "max_tokens": 500,
     "temperature": 0.7,
     "top_p": 0.95,
-    "n_ctx": 4096,  # افزایش برای Cache Reuse بهتر
+    "n_ctx": 4096,
     "streaming": True,
     "reply": True,
     "developer_mode": False,
     "system_prompt_enabled": False,
     "system_prompt": "تو یک دستیار مفید و بی‌سازشکاری.",
-    "show_thinking_timer": True,
-    "enable_thinking": True  # گزینه جدید: فعال/غیرفعال کردن Think
+    "show_thinking_timer": True
 }
 
 # -------------------- توابع کمکی --------------------
@@ -76,9 +75,11 @@ def save_user_settings(user_id: int, settings: dict):
         json.dump(settings, f)
 
 def remove_think_tags(text: str) -> str:
+    """حذف کامل تگ think و محتوای داخل آن"""
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 def clean_response(text: str) -> str:
+    """پاکسازی کامل پاسخ از think و whitespace اضافی"""
     text = remove_think_tags(text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
@@ -172,7 +173,7 @@ def download_model():
         llm = Llama(
             model_path=MODEL_PATH,
             n_ctx=DEFAULT_SETTINGS["n_ctx"],
-            n_threads=os.cpu_count() or 2,  # استفاده از تمام هسته‌های CPU
+            n_threads=os.cpu_count() or 2,
             chat_format="qwen",
             verbose=False
         )
@@ -186,7 +187,7 @@ def download_model():
 def count_tokens(text: str) -> int:
     return len(text) // 4
 
-# -------------------- تولید پاسخ غیراستریم --------------------
+# -------------------- تولید پاسخ غیراستریم (برنامه‌نویس و حالت عادی بدون استریم) --------------------
 def get_response_non_streaming(user_id: int, chat_id: str, prompt: str) -> Tuple[str, int, int]:
     settings = load_user_settings(user_id)
     raw_history = load_chat_history(user_id, chat_id)
@@ -200,8 +201,7 @@ def get_response_non_streaming(user_id: int, chat_id: str, prompt: str) -> Tuple
         max_tokens=settings["max_tokens"],
         temperature=settings["temperature"],
         top_p=settings["top_p"],
-        stream=False,
-        chat_template_kwargs={"enable_thinking": settings.get("enable_thinking", True)}
+        stream=False
     )
     raw_response = response['choices'][0]['message']['content']
     cleaned_response = clean_response(raw_response)
@@ -212,7 +212,7 @@ def get_response_non_streaming(user_id: int, chat_id: str, prompt: str) -> Tuple
     update_chat_name_if_needed(user_id, chat_id)
     return cleaned_response, prompt_tokens, completion_tokens
 
-# -------------------- تولید پاسخ با استریم --------------------
+# -------------------- تولید پاسخ با استریم (حذف think در لحظه) --------------------
 def generate_response_stream(user_id: int, chat_id: str, prompt: str):
     settings = load_user_settings(user_id)
     raw_history = load_chat_history(user_id, chat_id)
@@ -226,8 +226,7 @@ def generate_response_stream(user_id: int, chat_id: str, prompt: str):
         max_tokens=settings["max_tokens"],
         temperature=settings["temperature"],
         top_p=settings["top_p"],
-        stream=True,
-        chat_template_kwargs={"enable_thinking": settings.get("enable_thinking", True)}
+        stream=True
     )
     full_response = ""
     for chunk in stream:
@@ -493,7 +492,6 @@ async def refresh_settings_menu(query, user_id):
         f"🔁 ریپلای: {'فعال' if settings['reply'] else 'غیرفعال'}\n"
         f"👨‍💻 حالت برنامه‌نویس: {'فعال' if settings.get('developer_mode', False) else 'غیرفعال'}\n"
         f"🧠 نمایش تایمر: {'فعال' if settings.get('show_thinking_timer', True) else 'غیرفعال'}\n"
-        f"🧠 Think: {'فعال' if settings.get('enable_thinking', True) else 'غیرفعال'}\n"
         f"✏️ سیستم پرامپت: {'فعال' if settings.get('system_prompt_enabled', False) else 'خاموش'}\n"
     )
     if settings.get('system_prompt_enabled', False):
@@ -507,7 +505,6 @@ async def refresh_settings_menu(query, user_id):
         [InlineKeyboardButton("تغییر ریپلای", callback_data="toggle_reply")],
         [InlineKeyboardButton("تغییر حالت برنامه‌نویس", callback_data="toggle_dev_mode")],
         [InlineKeyboardButton("تغییر نمایش تایمر", callback_data="toggle_timer")],
-        [InlineKeyboardButton("فعال/غیرفعال کردن Think", callback_data="toggle_thinking")],
         [InlineKeyboardButton("فعال/غیرفعال کردن سیستم پرامپت", callback_data="toggle_system_prompt")],
         [InlineKeyboardButton("✏️ ویرایش متن سیستم پرامپت", callback_data="edit_system_prompt_text")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="main_menu")]
@@ -538,7 +535,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, f"لطفاً مقدار جدید {param} را بفرستید:")
         return
 
-    elif data in ["toggle_streaming", "toggle_reply", "toggle_dev_mode", "toggle_timer", "toggle_system_prompt", "toggle_thinking"]:
+    elif data in ["toggle_streaming", "toggle_reply", "toggle_dev_mode", "toggle_timer", "toggle_system_prompt"]:
         settings = load_user_settings(user_id)
         if data == "toggle_streaming":
             settings["streaming"] = not settings["streaming"]
@@ -550,8 +547,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings["show_thinking_timer"] = not settings.get("show_thinking_timer", True)
         elif data == "toggle_system_prompt":
             settings["system_prompt_enabled"] = not settings.get("system_prompt_enabled", False)
-        elif data == "toggle_thinking":
-            settings["enable_thinking"] = not settings.get("enable_thinking", True)
         save_user_settings(user_id, settings)
         await refresh_settings_menu(query, user_id)
         return
@@ -603,7 +598,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- ریپلای: پاسخ به پیام شما به صورت ریپلای.\n"
             "- حالت برنامه‌نویس: خروجی فقط در فایل txt ارسال می‌شود (بدون نمایش در چت).\n"
             "- نمایش تایمر: هنگام تولید پاسخ، یک پیام با تایمر نشان می‌دهد و می‌توانید لغو کنید.\n"
-            "- Think: فعال/غیرفعال کردن فرآیند استدلال داخلی مدل (غیرفعال = سریع‌تر).\n"
             "- سیستم پرامپت: می‌توانید یک دستورالعمل سیستمی برای مدل تنظیم کنید (پیش‌فرض خاموش).\n"
             "- ریست اکانت: تمام داده‌های شما را پاک می‌کند.\n\n"
             "برای تغییر هر گزینه، به بخش تنظیمات بروید."
