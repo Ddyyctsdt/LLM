@@ -11,19 +11,25 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
       - name: Install dependencies
         run: pip install python-telegram-bot llama-cpp-python requests
-      - name: Cache model
+
+      - name: Cache model (Sinbad Q5_K_M)
         uses: actions/cache@v4
         with:
           path: ./model.gguf
-          key: qwen-model-v2
-          restore-keys: qwen-model-v2-
+          key: sinbad-q5km-model-v1
+          restore-keys: sinbad-q5km-model-v1-
+
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          # اگر مدل نیاز به توکن Hugging Face دارد (گیت شده)، این خط را اضافه کنید
+          # HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python bot.py
